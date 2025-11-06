@@ -13,6 +13,7 @@
 #include "klee/Support/OptionCategories.h"
 
 #include <csignal>
+#include <cstdlib>
 
 #ifdef ENABLE_Z3
 
@@ -51,6 +52,19 @@ llvm::cl::opt<unsigned>
     Z3VerbosityLevel("debug-z3-verbosity", llvm::cl::init(0),
                      llvm::cl::desc("Z3 verbosity level (default=0)"),
                      llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::list<std::string> Z3SolverParams(
+    "z3-solver-param", llvm::cl::ZeroOrMore,
+    llvm::cl::desc("Set Z3 solver parameters in the format 'key=value'. "
+                   "Can be specified multiple times for different parameters. "
+                   "Examples: -z3-solver-param=smt.relevancy=0 "
+                   "-z3-solver-param=smt.arith.solver=2"),
+    llvm::cl::cat(klee::SolvingCat));
+
+llvm::cl::opt<bool> Z3ValidateParams(
+    "debug-z3-validate-params", llvm::cl::init(false),
+    llvm::cl::desc("Validate that Z3 parameters were applied correctly by dumping solver configuration"),
+    llvm::cl::cat(klee::SolvingCat));
 }
 
 #include "llvm/Support/ErrorHandling.h"
@@ -72,6 +86,7 @@ private:
                          std::vector<std::vector<unsigned char> > *values,
                          bool &hasSolution);
   bool validateZ3Model(::Z3_solver &theSolver, ::Z3_model &theModel);
+  void parseAndSetZ3Parameters();
 
 public:
   Z3SolverImpl();
@@ -115,6 +130,9 @@ Z3SolverImpl::Z3SolverImpl()
   timeoutParamStrSymbol = Z3_mk_string_symbol(builder->ctx, "timeout");
   setCoreSolverTimeout(timeout);
 
+  // Parse and set user-specified Z3 parameters
+  parseAndSetZ3Parameters();
+
   if (!Z3QueryDumpFile.empty()) {
     std::string error;
     dumpedQueriesFile = klee_open_output_file(Z3QueryDumpFile, error);
@@ -137,6 +155,76 @@ Z3SolverImpl::Z3SolverImpl()
 
 Z3SolverImpl::~Z3SolverImpl() {
   Z3_params_dec_ref(builder->ctx, solverParameters);
+}
+
+void Z3SolverImpl::parseAndSetZ3Parameters() {
+  for (const auto &paramStr : Z3SolverParams) {
+    size_t equalPos = paramStr.find('=');
+    if (equalPos == std::string::npos) {
+      klee_warning("Invalid Z3 parameter format (missing '='): '%s'. "
+                   "Expected format: 'key=value'", paramStr.c_str());
+      continue;
+    }
+
+    std::string key = paramStr.substr(0, equalPos);
+    std::string value = paramStr.substr(equalPos + 1);
+
+    if (key.empty()) {
+      klee_warning("Invalid Z3 parameter: empty key in '%s'", paramStr.c_str());
+      continue;
+    }
+
+    if (value.empty()) {
+      klee_warning("Invalid Z3 parameter: empty value in '%s'", paramStr.c_str());
+      continue;
+    }
+
+    // Create Z3 symbol for the parameter key
+    ::Z3_symbol paramSymbol = Z3_mk_string_symbol(builder->ctx, key.c_str());
+
+    // Try to determine the type of the value and set it accordingly
+    // First, try to parse as boolean
+    if (value == "true" || value == "True" || value == "TRUE") {
+      Z3_params_set_bool(builder->ctx, solverParameters, paramSymbol, true);
+      klee_message("Set Z3 parameter '%s' = true", key.c_str());
+    } else if (value == "false" || value == "False" || value == "FALSE") {
+      Z3_params_set_bool(builder->ctx, solverParameters, paramSymbol, false);
+      klee_message("Set Z3 parameter '%s' = false", key.c_str());
+    } else {
+      // Try to parse as unsigned integer
+      char *endPtr = nullptr;
+      unsigned long ulongValue = std::strtoul(value.c_str(), &endPtr, 10);
+      
+      // Check if the entire string was a valid unsigned integer
+      if (endPtr != nullptr && *endPtr == '\0' && endPtr != value.c_str()) {
+        // Successfully parsed as unsigned integer
+        unsigned uintValue = static_cast<unsigned>(ulongValue);
+        Z3_params_set_uint(builder->ctx, solverParameters, paramSymbol, uintValue);
+        klee_message("Set Z3 parameter '%s' = %u", key.c_str(), uintValue);
+      } else {
+        // Try to parse as double
+        char *doubleEndPtr = nullptr;
+        double doubleValue = std::strtod(value.c_str(), &doubleEndPtr);
+        
+        if (doubleEndPtr != nullptr && *doubleEndPtr == '\0' && doubleEndPtr != value.c_str()) {
+          // Successfully parsed as double
+          Z3_params_set_double(builder->ctx, solverParameters, paramSymbol, doubleValue);
+          klee_message("Set Z3 parameter '%s' = %f", key.c_str(), doubleValue);
+        } else {
+          // Treat as symbol/string
+          ::Z3_symbol valueSymbol = Z3_mk_string_symbol(builder->ctx, value.c_str());
+          Z3_params_set_symbol(builder->ctx, solverParameters, paramSymbol, valueSymbol);
+          klee_message("Set Z3 parameter '%s' = '%s'", key.c_str(), value.c_str());
+        }
+      }
+    }
+  }
+
+  // If validation is enabled, dump the parameter configuration
+  if (Z3ValidateParams && !Z3SolverParams.empty()) {
+    ::Z3_string paramsStr = Z3_params_to_string(builder->ctx, solverParameters);
+    klee_message("Z3 Parameters Configuration:\n%s", paramsStr);
+  }
 }
 
 Z3Solver::Z3Solver() : Solver(std::make_unique<Z3SolverImpl>()) {}
@@ -288,6 +376,11 @@ bool Z3SolverImpl::internalRunSolver(
 
   if (dumpedQueriesFile) {
     *dumpedQueriesFile << "; start Z3 query\n";
+    if (Z3ValidateParams && !Z3SolverParams.empty()) {
+      *dumpedQueriesFile << "; Parameters: " 
+                         << Z3_params_to_string(builder->ctx, solverParameters) 
+                         << "\n";
+    }
     *dumpedQueriesFile << Z3_solver_to_string(builder->ctx, theSolver);
     *dumpedQueriesFile << "(check-sat)\n";
     *dumpedQueriesFile << "(reset)\n";
